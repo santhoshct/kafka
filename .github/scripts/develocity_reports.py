@@ -48,6 +48,11 @@ class TestContainerResult:
     outcome: str
     timestamp: Optional[datetime] = None
 
+@dataclass
+class TestCaseResult(TestResult):
+    """Extends TestResult to include container-specific information"""
+    container_name: str = ""
+    
 class TestAnalyzer:
     def __init__(self, base_url: str, auth_token: str):
         self.base_url = base_url
@@ -55,7 +60,7 @@ class TestAnalyzer:
             'Authorization': f'Bearer {auth_token}',
             'Accept': 'application/json'
         }
-        self.default_chunk_size = timedelta(days=10)
+        self.default_chunk_size = timedelta(days=14)
         self.api_retry_delay = 2  # seconds
         self.max_api_retries = 3
 
@@ -342,12 +347,11 @@ class TestAnalyzer:
     def get_problematic_quarantined_tests(self, results: List[TestResult],
                                         quarantine_threshold_days: int = 60,
                                         min_failure_rate: float = 0.3,
-                                        recent_failure_threshold: float = 0.5) -> Dict[str, Tuple[TestResult, int, float, float]]:
-        """
-        Enhanced version that considers both overall and recent failure rates
-        """
+                                        recent_failure_threshold: float = 0.5) -> Dict[str, Dict]:
+        """Enhanced version that includes test case details"""
         problematic_tests = {}
         current_time = datetime.now(pytz.UTC)
+        chunk_start = current_time - timedelta(days=7)  # Last 7 days for test cases
         
         for result in results:
             days_quarantined = (current_time - result.first_seen).days
@@ -357,16 +361,99 @@ class TestAnalyzer:
                     problem_runs = result.outcome_distribution.failed + result.outcome_distribution.flaky
                     failure_rate = problem_runs / total_runs
                     
-                    # Consider both overall and recent failure rates
                     if failure_rate >= min_failure_rate or result.recent_failure_rate >= recent_failure_threshold:
-                        problematic_tests[result.name] = (
-                            result, 
-                            days_quarantined, 
-                            failure_rate,
-                            result.recent_failure_rate
-                        )
+                        # Get detailed test case information
+                        try:
+                            test_cases = self.get_test_case_details(
+                                result.name, 
+                                "kafka", 
+                                chunk_start,
+                                current_time
+                            )
+                            
+                            problematic_tests[result.name] = {
+                                'container_result': result,
+                                'days_quarantined': days_quarantined,
+                                'failure_rate': failure_rate,
+                                'recent_failure_rate': result.recent_failure_rate,
+                                'test_cases': test_cases
+                            }
+                        except Exception as e:
+                            logger.error(f"Error getting test case details for {result.name}: {str(e)}")
         
         return problematic_tests
+
+    def get_test_case_details(self, container_name: str, project: str, chunk_start: datetime, chunk_end: datetime) -> List[TestCaseResult]:
+        """
+        Fetch detailed test case results for a specific container.
+        """
+        query_params = {
+            'container': container_name,
+            'testOutcomes': ['failed', 'flaky'],
+            'query': f'project:{project} buildStartTime:[{chunk_start.isoformat()} TO {chunk_end.isoformat()}]',
+            'include': ['buildScanIds'],
+            'limit': 1000
+        }
+
+        try:
+            response = requests.get(
+                f'{self.base_url}/api/tests/cases',
+                headers=self.headers,
+                params=query_params
+            )
+            response.raise_for_status()
+            
+            test_cases = []
+            content = response.json().get('content', [])
+            
+            # Collect all build IDs first
+            build_ids = set()
+            for test in content:
+                if 'buildScanIdsByOutcome' in test:
+                    for outcome_type, ids in test['buildScanIdsByOutcome'].items():
+                        build_ids.update(ids)
+            
+            # Get build info for all build IDs
+            builds = self.get_build_info(list(build_ids), project, "quarantinedTest", 7)  # 7 days for test cases
+            
+            for test in content:
+                outcome_data = test['outcomeDistribution']
+                if 'notSelected' in outcome_data:
+                    outcome_data['not_selected'] = outcome_data.pop('notSelected')
+                outcome = TestOutcome(**outcome_data)
+                
+                test_case = TestCaseResult(
+                    name=test['name'],
+                    outcome_distribution=outcome,
+                    first_seen=chunk_start,
+                    container_name=container_name
+                )
+                
+                # Add build information with proper timestamps
+                if 'buildScanIdsByOutcome' in test:
+                    for outcome_type, build_ids in test['buildScanIdsByOutcome'].items():
+                        for build_id in build_ids:
+                            if build_id in builds:
+                                build_info = builds[build_id]
+                                test_case.timeline.append(
+                                    TestTimelineEntry(
+                                        build_id=build_id,
+                                        timestamp=build_info.timestamp,  # Now using actual build timestamp
+                                        outcome=outcome_type
+                                    )
+                                )
+                            else:
+                                logger.warning(f"Build ID {build_id} not found for test case {test['name']}")
+                
+                # Sort timeline by timestamp
+                test_case.timeline.sort(key=lambda x: x.timestamp)
+                test_cases.append(test_case)
+            
+            return test_cases
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error fetching test case details for {container_name}: {str(e)}")
+            raise
 
 def main():
     # Configuration
@@ -374,14 +461,13 @@ def main():
     AUTH_TOKEN = os.environ.get("DEVELOCITY_ACCESS_TOKEN")
     PROJECT = "kafka"
     TEST_TYPE = "quarantinedTest"
-    QUARANTINE_THRESHOLD_DAYS = 14  # Adjust this value as needed
-    MIN_FAILURE_RATE = 0.1  # 10% failure rate threshold
-    RECENT_FAILURE_THRESHOLD = 0.5  # 50% recent failure rate threshold
+    QUARANTINE_THRESHOLD_DAYS = 14
+    MIN_FAILURE_RATE = 0.1
+    RECENT_FAILURE_THRESHOLD = 0.5
 
     analyzer = TestAnalyzer(BASE_URL, AUTH_TOKEN)
     
     try:
-        # Pass quarantine threshold to get_test_results
         results = analyzer.get_test_results(
             PROJECT, 
             quarantine_threshold_days=QUARANTINE_THRESHOLD_DAYS,
@@ -395,39 +481,75 @@ def main():
         )
         
         print(f"\nHigh-Priority Quarantined Tests Report ({datetime.now(pytz.UTC).strftime('%Y-%m-%d %H:%M:%S')} UTC)")
-        print("=" * 80)
+        print("=" * 100)
         
         if not problematic_tests:
             print("\nNo tests found matching the criteria.")
         else:
             sorted_tests = sorted(
                 problematic_tests.items(), 
-                key=lambda x: (x[1][2], x[1][1]),
+                key=lambda x: (x[1]['failure_rate'], x[1]['days_quarantined']),
                 reverse=True
             )
             
-            print(f"\nFound {len(sorted_tests)} high-priority tests:")
-            for test_name, (result, days_quarantined, failure_rate, recent_failure_rate) in sorted_tests:
-                print(f"\nTest: {test_name}")
-                print(f"Timeline entries: {len(result.timeline)}")  # Debug output
-                print(f"First seen: {result.first_seen.strftime('%Y-%m-%d')}")
-                print("Recent Outcomes:")
-                print(f"  Failed: {result.outcome_distribution.failed}")
-                print(f"  Flaky: {result.outcome_distribution.flaky}")
-                print(f"  Passed: {result.outcome_distribution.passed}")
-                print(f"  Total Runs: {result.outcome_distribution.total}")
+            print(f"\nFound {len(sorted_tests)} high-priority quarantined test containers:")
+            for container_name, details in sorted_tests:
+                container_result = details['container_result']
                 
-                if result.timeline:
-                    print("\nTest Timeline (last 10 executions):")
-                    print("Date/Time (UTC)      Outcome    Build ID")
-                    print("-" * 50)
-                    for entry in sorted(result.timeline, key=lambda x: x.timestamp)[-10:]:
+                print(f"\n{container_name}")
+                print("=" * len(container_name))
+                print(f"Quarantined for {details['days_quarantined']} days")
+                print(f"Container Failure Rate: {details['failure_rate']:.2%}")
+                print(f"Recent Failure Rate: {details['recent_failure_rate']:.2%}")
+                print("\nContainer Statistics:")
+                print(f"  Total Runs: {container_result.outcome_distribution.total}")
+                print(f"  Failed: {container_result.outcome_distribution.failed}")
+                print(f"  Flaky: {container_result.outcome_distribution.flaky}")
+                print(f"  Passed: {container_result.outcome_distribution.passed}")
+                
+                # Show container timeline
+                if container_result.timeline:
+                    print("\nContainer Recent Executions:")
+                    print("  Date/Time (UTC)      Outcome    Build ID")
+                    print("  " + "-" * 48)
+                    for entry in sorted(container_result.timeline, key=lambda x: x.timestamp)[-5:]:
                         date_str = entry.timestamp.strftime('%Y-%m-%d %H:%M')
-                        print(f"{date_str:<17} {entry.outcome:<10} {entry.build_id}")
-                else:
-                    print("\nNo timeline entries found!")  # Debug output
+                        print(f"  {date_str:<17} {entry.outcome:<10} {entry.build_id}")
                 
-                print("\n" + "=" * 80)
+                print("\nTest Cases (Last 7 Days):")
+                print("  " + "-" * 48)
+                
+                # Sort test cases by failure rate
+                sorted_cases = sorted(
+                    details['test_cases'],
+                    key=lambda x: (x.outcome_distribution.failed + x.outcome_distribution.flaky) / x.outcome_distribution.total if x.outcome_distribution.total > 0 else 0,
+                    reverse=True
+                )
+                
+                for test_case in sorted_cases:
+                    total_runs = test_case.outcome_distribution.total
+                    if total_runs > 0:
+                        failure_rate = (test_case.outcome_distribution.failed + test_case.outcome_distribution.flaky) / total_runs
+                        
+                        # Extract the method name from the full test case name
+                        method_name = test_case.name.split('.')[-1]
+                        
+                        print(f"\n  → {method_name}")
+                        print(f"    Failure Rate: {failure_rate:.2%}")
+                        print(f"    Runs: {total_runs:3d} | Failed: {test_case.outcome_distribution.failed:3d} | "
+                              f"Flaky: {test_case.outcome_distribution.flaky:3d} | "
+                              f"Passed: {test_case.outcome_distribution.passed:3d}")
+                        
+                        # Show test case timeline
+                        if test_case.timeline:
+                            print("\n    Recent Executions:")
+                            print("    Date/Time (UTC)      Outcome    Build ID")
+                            print("    " + "-" * 44)
+                            for entry in sorted(test_case.timeline, key=lambda x: x.timestamp)[-3:]:  # Last 3 executions
+                                date_str = entry.timestamp.strftime('%Y-%m-%d %H:%M')
+                                print(f"    {date_str:<17} {entry.outcome:<10} {entry.build_id}")
+                
+                print("\n" + "=" * 100)
                 
     except Exception as e:
         logger.exception("Error occurred during report generation")
