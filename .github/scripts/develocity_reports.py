@@ -1,7 +1,7 @@
 import os
 import requests
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Tuple, Optional
 from datetime import datetime, timedelta
 import pytz  # Add this import for timezone handling
@@ -9,6 +9,9 @@ from collections import defaultdict
 import time
 import logging
 import concurrent.futures  # Add this import at the top
+import pathlib
+import pickle
+from abc import ABC, abstractmethod
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +56,90 @@ class TestCaseResult(TestResult):
     """Extends TestResult to include container-specific information"""
     container_name: str = ""
     
+@dataclass
+class BuildCache:
+    last_update: datetime
+    builds: Dict[str, 'BuildInfo']
+    
+    def to_dict(self):
+        return {
+            'last_update': self.last_update.isoformat(),
+            'builds': {k: asdict(v) for k, v in self.builds.items()}
+        }
+    
+    @classmethod
+    def from_dict(cls, data: dict) -> 'BuildCache':
+        return cls(
+            last_update=datetime.fromisoformat(data['last_update']),
+            builds={k: BuildInfo(**v) for k, v in data['builds'].items()}
+        )
+
+class CacheProvider(ABC):
+    @abstractmethod
+    def get_cache(self) -> Optional[BuildCache]:
+        pass
+    
+    @abstractmethod
+    def save_cache(self, cache: BuildCache):
+        pass
+
+class LocalCacheProvider(CacheProvider):
+    def __init__(self, cache_dir: str = None):
+        if cache_dir is None:
+            cache_dir = os.path.join(os.path.expanduser("~"), ".develocity_cache")
+        self.cache_file = os.path.join(cache_dir, "build_cache.pkl")
+        os.makedirs(cache_dir, exist_ok=True)
+    
+    def get_cache(self) -> Optional[BuildCache]:
+        try:
+            if os.path.exists(self.cache_file):
+                with open(self.cache_file, 'rb') as f:
+                    return pickle.load(f)
+        except Exception as e:
+            logger.warning(f"Failed to load local cache: {e}")
+        return None
+    
+    def save_cache(self, cache: BuildCache):
+        try:
+            with open(self.cache_file, 'wb') as f:
+                pickle.dump(cache, f)
+        except Exception as e:
+            logger.warning(f"Failed to save local cache: {e}")
+
+class GitHubActionsCacheProvider(CacheProvider):
+    def __init__(self):
+        self.cache_key = "develocity-build-cache"
+    
+    def get_cache(self) -> Optional[BuildCache]:
+        try:
+            # Check if running in GitHub Actions
+            if not os.environ.get('GITHUB_ACTIONS'):
+                return None
+                
+            cache_path = os.environ.get('GITHUB_WORKSPACE', '')
+            cache_file = os.path.join(cache_path, self.cache_key + '.json')
+            
+            if os.path.exists(cache_file):
+                with open(cache_file, 'r') as f:
+                    data = json.load(f)
+                    return BuildCache.from_dict(data)
+        except Exception as e:
+            logger.warning(f"Failed to load GitHub Actions cache: {e}")
+        return None
+    
+    def save_cache(self, cache: BuildCache):
+        try:
+            if not os.environ.get('GITHUB_ACTIONS'):
+                return
+                
+            cache_path = os.environ.get('GITHUB_WORKSPACE', '')
+            cache_file = os.path.join(cache_path, self.cache_key + '.json')
+            
+            with open(cache_file, 'w') as f:
+                json.dump(cache.to_dict(), f)
+        except Exception as e:
+            logger.warning(f"Failed to save GitHub Actions cache: {e}")
+
 class TestAnalyzer:
     def __init__(self, base_url: str, auth_token: str):
         self.base_url = base_url
@@ -63,6 +150,31 @@ class TestAnalyzer:
         self.default_chunk_size = timedelta(days=14)
         self.api_retry_delay = 2  # seconds
         self.max_api_retries = 3
+        
+        # Initialize cache providers
+        self.cache_providers = [
+            GitHubActionsCacheProvider(),
+            LocalCacheProvider()
+        ]
+        self.build_cache = None
+        self._load_cache()
+    
+    def _load_cache(self):
+        """Load cache from the first available provider"""
+        for provider in self.cache_providers:
+            cache = provider.get_cache()
+            if cache is not None:
+                self.build_cache = cache
+                logger.info(f"Loaded cache from {provider.__class__.__name__}")
+                return
+        logger.info("No existing cache found")
+    
+    def _save_cache(self):
+        """Save cache to all providers"""
+        if self.build_cache:
+            for provider in self.cache_providers:
+                provider.save_cache(self.build_cache)
+                logger.info(f"Saved cache to {provider.__class__.__name__}")
 
     def build_query(self, project: str, chunk_start: datetime, chunk_end: datetime, test_type: str) -> str:
         """
@@ -77,7 +189,7 @@ class TestAnalyzer:
         Returns:
             A formatted query string.
         """
-        return f'project:{project} buildStartTime:[{chunk_start.isoformat()} TO {chunk_end.isoformat()}] requested:"*{test_type}*"'
+        return f'project:{project} buildStartTime:[{chunk_start.isoformat()} TO {chunk_end.isoformat()}] gradle.requestedTasks:{test_type}'
     
     def process_chunk(self, chunk_start: datetime, chunk_end: datetime, project: str, 
                      test_type: str, remaining_build_ids: set, max_builds_per_request: int) -> Dict[str, BuildInfo]:
@@ -161,10 +273,34 @@ class TestAnalyzer:
         builds = {}
         max_builds_per_request = 100
         cutoff_date = datetime.now(pytz.UTC) - timedelta(days=query_days)
-        chunk_size = self.default_chunk_size
         
+        # Get builds from cache if available
+        if self.build_cache:
+            cached_builds = self.build_cache.builds
+            cached_cutoff = self.build_cache.last_update - timedelta(days=query_days)
+            
+            # Use cached data for builds within the cache period
+            for build_id in build_ids:
+                if build_id in cached_builds:
+                    build = cached_builds[build_id]
+                    if build.timestamp >= cached_cutoff:
+                        builds[build_id] = build
+            
+            # Update cutoff date to only fetch new data
+            cutoff_date = self.build_cache.last_update
+            logger.info(f"Using cached data up to {cutoff_date.isoformat()}")
+            
+            # Remove already found builds from the search list
+            build_ids = [bid for bid in build_ids if bid not in builds]
+        
+        if not build_ids:
+            logger.info("All builds found in cache")
+            return builds
+        
+        # Fetch remaining builds from API
         remaining_build_ids = set(build_ids)
         current_time = datetime.now(pytz.UTC)
+        chunk_size = self.default_chunk_size
 
         # Create time chunks
         chunks = []
@@ -191,38 +327,41 @@ class TestAnalyzer:
             }
 
             for future in concurrent.futures.as_completed(future_to_chunk):
-                chunk = future_to_chunk[future]
                 try:
                     chunk_builds = future.result()
                     builds.update(chunk_builds)
-                    # Remove found build IDs from the remaining set
                     remaining_build_ids -= set(chunk_builds.keys())
                 except Exception as e:
-                    logger.error(f"Chunk {chunk} generated an exception: {str(e)}")
+                    logger.error(f"Chunk processing generated an exception: {str(e)}")
 
         total_duration = time.time() - total_start_time
         logger.info(
-            f"\nOverall Build Info Performance:"
+            f"\nBuild Info Performance:"
             f"\n  Total Duration: {total_duration:.2f}s"
             f"\n  Builds Retrieved: {len(builds)}"
             f"\n  Builds Not Found: {len(remaining_build_ids)}"
         )
         
-        if remaining_build_ids:
-            logger.warning(f"Could not find {len(remaining_build_ids)} builds: {sorted(remaining_build_ids)}")
+        # Update cache with new data
+        if builds:
+            if not self.build_cache:
+                self.build_cache = BuildCache(current_time, {})
+            self.build_cache.builds.update(builds)
+            self.build_cache.last_update = current_time
+            self._save_cache()
         
         return builds
 
-    def get_test_results(self, project: str, quarantine_threshold_days: int, test_type: str = "quarantinedTest",
+    def get_test_results(self, project: str, threshold_days: int, test_type: str = "quarantinedTest",
                         outcomes: List[str] = None) -> List[TestResult]:
         """Fetch test results with timeline information"""
         if outcomes is None:
             outcomes = ["failed", "flaky"]
 
-        logger.debug(f"Fetching test results for project {project}, last {quarantine_threshold_days} days")
+        logger.debug(f"Fetching test results for project {project}, last {threshold_days} days")
         
         end_time = datetime.now(pytz.UTC)
-        start_time = end_time - timedelta(days=quarantine_threshold_days)
+        start_time = end_time - timedelta(days=threshold_days)
         
         all_results = {}
         build_ids = set()
@@ -280,7 +419,7 @@ class TestAnalyzer:
         logger.debug(f"Total unique build IDs collected: {len(build_ids)}")
         
         # Fetch build information using the updated get_build_info method
-        builds = self.get_build_info(list(build_ids), project, test_type, quarantine_threshold_days)
+        builds = self.get_build_info(list(build_ids), project, test_type, threshold_days)
         logger.debug(f"Retrieved {len(builds)} builds from API")
         logger.debug(f"Retrieved build IDs: {sorted(builds.keys())}")
 
@@ -368,7 +507,8 @@ class TestAnalyzer:
                                 result.name, 
                                 "kafka", 
                                 chunk_start,
-                                current_time
+                                current_time,
+                                test_type="quarantinedTest"
                             )
                             
                             problematic_tests[result.name] = {
@@ -383,15 +523,25 @@ class TestAnalyzer:
         
         return problematic_tests
 
-    def get_test_case_details(self, container_name: str, project: str, chunk_start: datetime, chunk_end: datetime) -> List[TestCaseResult]:
+    def get_test_case_details(self, container_name: str, project: str, chunk_start: datetime, chunk_end: datetime, test_type: str = "quarantinedTest") -> List[TestCaseResult]:
         """
         Fetch detailed test case results for a specific container.
+        
+        Args:
+            container_name: Name of the test container
+            project: The project name
+            chunk_start: Start time for the query
+            chunk_end: End time for the query
+            test_type: Type of tests to query (default: "quarantinedTest")
         """
+        # Use the helper method to build the query, similar to get_test_results
+        query = self.build_query(project, chunk_start, chunk_end, test_type)
+        
         query_params = {
-            'container': container_name,
+            'query': query,
             'testOutcomes': ['failed', 'flaky'],
-            'query': f'project:{project} buildStartTime:[{chunk_start.isoformat()} TO {chunk_end.isoformat()}]',
-            'include': ['buildScanIds'],
+            'container': container_name,
+            'include': ['buildScanIds'],  # Explicitly request build scan IDs
             'limit': 1000
         }
 
@@ -414,7 +564,7 @@ class TestAnalyzer:
                         build_ids.update(ids)
             
             # Get build info for all build IDs
-            builds = self.get_build_info(list(build_ids), project, "quarantinedTest", 7)  # 7 days for test cases
+            builds = self.get_build_info(list(build_ids), project, test_type, 7)  # 7 days for test cases
             
             for test in content:
                 outcome_data = test['outcomeDistribution']
@@ -438,7 +588,7 @@ class TestAnalyzer:
                                 test_case.timeline.append(
                                     TestTimelineEntry(
                                         build_id=build_id,
-                                        timestamp=build_info.timestamp,  # Now using actual build timestamp
+                                        timestamp=build_info.timestamp,
                                         outcome=outcome_type
                                     )
                                 )
@@ -455,36 +605,182 @@ class TestAnalyzer:
             logger.error(f"Error fetching test case details for {container_name}: {str(e)}")
             raise
 
+    def get_flaky_test_regressions(self, project: str, results: List[TestResult], 
+                                 recent_days: int = 7, min_flaky_rate: float = 0.2) -> Dict[str, Dict]:
+        """
+        Identify tests that have recently started showing flaky behavior.
+        
+        Args:
+            project: The project name
+            results: List of test results
+            recent_days: Number of days to consider for recent behavior
+            min_flaky_rate: Minimum flaky rate to consider a test as problematic
+        """
+        flaky_regressions = {}
+        current_time = datetime.now(pytz.UTC)
+        recent_cutoff = current_time - timedelta(days=recent_days)
+        
+        for result in results:
+            # Skip tests with no timeline data
+            if not result.timeline:
+                continue
+                
+            # Split timeline into recent and historical periods
+            recent_entries = [t for t in result.timeline if t.timestamp >= recent_cutoff]
+            historical_entries = [t for t in result.timeline if t.timestamp < recent_cutoff]
+            
+            if not recent_entries or not historical_entries:
+                continue
+            
+            # Calculate flaky rates
+            recent_flaky = sum(1 for t in recent_entries if t.outcome == 'flaky')
+            recent_total = len(recent_entries)
+            recent_flaky_rate = recent_flaky / recent_total if recent_total > 0 else 0
+            
+            historical_flaky = sum(1 for t in historical_entries if t.outcome == 'flaky')
+            historical_total = len(historical_entries)
+            historical_flaky_rate = historical_flaky / historical_total if historical_total > 0 else 0
+            
+            # Check if there's a significant increase in flakiness
+            if recent_flaky_rate >= min_flaky_rate and recent_flaky_rate > historical_flaky_rate * 1.5:
+                flaky_regressions[result.name] = {
+                    'result': result,
+                    'recent_flaky_rate': recent_flaky_rate,
+                    'historical_flaky_rate': historical_flaky_rate,
+                    'recent_executions': recent_entries,
+                    'historical_executions': historical_entries
+                }
+        
+        return flaky_regressions
+
+    def get_cleared_tests(self, project: str, results: List[TestResult], 
+                         success_threshold: float = 0.7, min_executions: int = 5) -> Dict[str, Dict]:
+        """
+        Identify quarantined tests that are consistently passing and could be cleared.
+        
+        Args:
+            project: The project name
+            results: List of test results
+            success_threshold: Required percentage of successful builds to be considered cleared
+            min_executions: Minimum number of executions required to make a determination
+        """
+        cleared_tests = {}
+        current_time = datetime.now(pytz.UTC)
+        
+        for result in results:
+            # Only consider tests with sufficient recent executions
+            recent_executions = result.timeline
+            if len(recent_executions) < min_executions:
+                continue
+            
+            # Calculate success rate
+            successful_runs = sum(1 for t in recent_executions 
+                                if t.outcome == 'passed')
+            success_rate = successful_runs / len(recent_executions)
+            
+            # Check if the test meets clearing criteria
+            if success_rate >= success_threshold:
+                # Verify no recent failures or flaky behavior
+                has_recent_issues = any(t.outcome in ['failed', 'flaky'] 
+                                     for t in recent_executions[-min_executions:])
+                
+                if not has_recent_issues:
+                    cleared_tests[result.name] = {
+                        'result': result,
+                        'success_rate': success_rate,
+                        'total_executions': len(recent_executions),
+                        'successful_runs': successful_runs,
+                        'recent_executions': recent_executions[-min_executions:]
+                    }
+        
+        return cleared_tests
+
 def main():
     # Configuration
     BASE_URL = "https://ge.apache.org"
     AUTH_TOKEN = os.environ.get("DEVELOCITY_ACCESS_TOKEN")
     PROJECT = "kafka"
-    TEST_TYPE = "quarantinedTest"
-    QUARANTINE_THRESHOLD_DAYS = 14
+    QUARANTINE_THRESHOLD_DAYS = 7
     MIN_FAILURE_RATE = 0.1
     RECENT_FAILURE_THRESHOLD = 0.5
+    SUCCESS_THRESHOLD = 0.7  # For cleared tests
+    MIN_FLAKY_RATE = 0.2    # For flaky regressions
 
     analyzer = TestAnalyzer(BASE_URL, AUTH_TOKEN)
     
     try:
-        results = analyzer.get_test_results(
+        # Get quarantined test results
+        quarantined_results = analyzer.get_test_results(
             PROJECT, 
-            quarantine_threshold_days=QUARANTINE_THRESHOLD_DAYS,
-            test_type=TEST_TYPE
+            threshold_days=QUARANTINE_THRESHOLD_DAYS,
+            test_type="quarantinedTest"
         )
+        
+        # Get regular test results for flaky regression analysis
+        regular_results = analyzer.get_test_results(
+            PROJECT,
+            threshold_days=7,  # Last 7 days for regular tests
+            test_type="test"
+        )
+        
+        # Generate reports
         problematic_tests = analyzer.get_problematic_quarantined_tests(
-            results, 
+            quarantined_results, 
             QUARANTINE_THRESHOLD_DAYS,
             MIN_FAILURE_RATE,
             RECENT_FAILURE_THRESHOLD
         )
         
-        print(f"\nHigh-Priority Quarantined Tests Report ({datetime.now(pytz.UTC).strftime('%Y-%m-%d %H:%M:%S')} UTC)")
+        flaky_regressions = analyzer.get_flaky_test_regressions(
+            PROJECT,
+            regular_results,
+            recent_days=7,
+            min_flaky_rate=MIN_FLAKY_RATE
+        )
+        
+        cleared_tests = analyzer.get_cleared_tests(
+            PROJECT,
+            quarantined_results,
+            success_threshold=SUCCESS_THRESHOLD
+        )
+        
+        # Print reports
+        print(f"\nTest Analysis Report ({datetime.now(pytz.UTC).strftime('%Y-%m-%d %H:%M:%S')} UTC)")
         print("=" * 100)
         
+        # Print Flaky Test Regressions
+        print("\nFlaky Test Regressions")
+        print("-" * 50)
+        if not flaky_regressions:
+            print("No flaky test regressions found.")
+        else:
+            for test_name, details in flaky_regressions.items():
+                print(f"\n{test_name}")
+                print(f"Recent Flaky Rate: {details['recent_flaky_rate']:.2%}")
+                print(f"Historical Flaky Rate: {details['historical_flaky_rate']:.2%}")
+                print("\nRecent Executions:")
+                for entry in sorted(details['recent_executions'], key=lambda x: x.timestamp)[-5:]:
+                    print(f"  {entry.timestamp.strftime('%Y-%m-%d %H:%M')} - {entry.outcome}")
+        
+        # Print Cleared Tests
+        print("\nCleared Tests (Ready for Unquarantine)")
+        print("-" * 50)
+        if not cleared_tests:
+            print("No tests ready to be cleared from quarantine.")
+        else:
+            for test_name, details in cleared_tests.items():
+                print(f"\n{test_name}")
+                print(f"Success Rate: {details['success_rate']:.2%}")
+                print(f"Total Executions: {details['total_executions']}")
+                print("\nRecent Executions:")
+                for entry in sorted(details['recent_executions'], key=lambda x: x.timestamp):
+                    print(f"  {entry.timestamp.strftime('%Y-%m-%d %H:%M')} - {entry.outcome}")
+        
+        # Print Defective Tests (with detailed reporting restored)
+        print("\nHigh-Priority Quarantined Tests")
+        print("-" * 50)
         if not problematic_tests:
-            print("\nNo tests found matching the criteria.")
+            print("No high-priority quarantined tests found.")
         else:
             sorted_tests = sorted(
                 problematic_tests.items(), 
@@ -549,7 +845,9 @@ def main():
                                 date_str = entry.timestamp.strftime('%Y-%m-%d %H:%M')
                                 print(f"    {date_str:<17} {entry.outcome:<10} {entry.build_id}")
                 
-                print("\n" + "=" * 100)
+                print("\n" + "-" * 50)
+        
+        print("\n" + "=" * 100)
                 
     except Exception as e:
         logger.exception("Error occurred during report generation")
