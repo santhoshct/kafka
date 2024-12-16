@@ -768,7 +768,50 @@ class TestAnalyzer:
         
         return cleared_tests
 
-def print_summary(problematic_tests: Dict[str, Dict], flaky_regressions: Dict[str, Dict]):
+def get_develocity_class_link(class_name: str, threshold_days: int) -> str:
+    """
+    Generate Develocity link for a test class
+    
+    Args:
+        class_name: Name of the test class
+        threshold_days: Number of days to look back in search
+    """
+    base_url = "https://ge.apache.org/scans/tests"
+    params = {
+        "search.rootProjectNames": "kafka",
+        "search.tags": "github,trunk",
+        "search.timeZoneId": "America/New_York",
+        "search.relativeStartTime": f"P{threshold_days}D",
+        "tests.container": class_name
+    }
+    return f"{base_url}?{'&'.join(f'{k}={requests.utils.quote(str(v))}' for k, v in params.items())}"
+
+def get_develocity_method_link(class_name: str, method_name: str, threshold_days: int) -> str:
+    """
+    Generate Develocity link for a test method
+    
+    Args:
+        class_name: Name of the test class
+        method_name: Name of the test method
+        threshold_days: Number of days to look back in search
+    """
+    base_url = "https://ge.apache.org/scans/tests"
+    
+    # Extract just the method name without the class prefix
+    if '.' in method_name:
+        method_name = method_name.split('.')[-1]
+        
+    params = {
+        "search.rootProjectNames": "kafka",
+        "search.tags": "github,trunk",
+        "search.timeZoneId": "America/New_York",
+        "search.relativeStartTime": f"P{threshold_days}D",
+        "tests.container": class_name,
+        "tests.test": method_name
+    }
+    return f"{base_url}?{'&'.join(f'{k}={requests.utils.quote(str(v))}' for k, v in params.items())}"
+
+def print_summary(problematic_tests: Dict[str, Dict], flaky_regressions: Dict[str, Dict], threshold_days: int):
     """Print a summary of the most problematic tests at the top of the report"""
     print("\n## Summary of Most Problematic Tests")
 
@@ -818,11 +861,14 @@ def print_summary(problematic_tests: Dict[str, Dict], flaky_regressions: Dict[st
     # Print summary
     print("<table><tr><td>Class</td><td>Test Case</td><td>Failure Rate</td><td>Build Scans</td></tr>")
     for full_class_name, cases in by_class.items():
-        print(f"<tr><td colspan=\"4\">{full_class_name}</td></tr>")
+        class_link = get_develocity_class_link(full_class_name, threshold_days)
+        print(f"<tr><td colspan=\"4\"><a href=\"{class_link}\">{full_class_name}</a></td></tr>")
         for case in cases:
             method = case['method']
             if method != 'N/A':
-                print(f"<tr><td></td><td>{method:<60}</td><td>{case['failure_rate']:.2%}</td><td>{case['total_runs']}</td></tr>")
+                method_link = get_develocity_method_link(full_class_name, f"{full_class_name}.{method}", threshold_days)
+                print(f"<tr><td></td><td><a href=\"{method_link}\">{method}</a></td>"
+                      f"<td>{case['failure_rate']:.2%}</td><td>{case['total_runs']}</td></tr>")
             else:
                 print(f"<tr><td></td><td></td><td>{case['failure_rate']:.2%}</td><td>{case['total_runs']}</td></tr>")
     print("</table>")
@@ -889,7 +935,7 @@ def main():
         print(f"\n# Flaky Test Report for {datetime.now(pytz.UTC).strftime('%Y-%m-%d')}")
         print(f"This report was run on {datetime.now(pytz.UTC).strftime('%Y-%m-%d %H:%M:%S')} UTC")
 
-        print_summary(problematic_tests, flaky_regressions)
+        print_summary(problematic_tests, flaky_regressions, QUARANTINE_THRESHOLD_DAYS)
 
         # Print Flaky Test Regressions
         print("\n## Flaky Test Regressions")
@@ -901,7 +947,8 @@ def main():
             print("<tr><td>Test Class</td><td>Recent Flaky Rate</td><td>Historical Rate</td><td>Recent Executions</td></tr>")
             
             for test_name, details in flaky_regressions.items():
-                print(f"<tr><td colspan=\"4\">{test_name}</td></tr>")
+                class_link = get_develocity_class_link(test_name, QUARANTINE_THRESHOLD_DAYS)
+                print(f"<tr><td colspan=\"4\"><a href=\"{class_link}\">{test_name}</a></td></tr>")
                 print(f"<tr><td></td><td>{details['recent_flaky_rate']:.2%}</td>"
                       f"<td>{details['historical_flaky_rate']:.2%}</td>"
                       f"<td>{len(details['recent_executions'])}</td></tr>")
@@ -918,12 +965,14 @@ def main():
         if not cleared_tests:
             print("No tests ready to be cleared from quarantine.")
         else:
+            # Print concise table with just class and method info
             print("\n<table>")
             print("<tr><td>Test Class</td><td>Test Method</td><td>Success Rate</td><td>Total Runs</td><td>Recent Status</td></tr>")
             
             for test_name, details in cleared_tests.items():
                 # Print class-level information
-                print(f"<tr><td colspan=\"5\">{test_name}</td></tr>")
+                class_link = get_develocity_class_link(test_name, QUARANTINE_THRESHOLD_DAYS)
+                print(f"<tr><td colspan=\"5\"><a href=\"{class_link}\">{test_name}</a></td></tr>")
                 print(f"<tr><td></td><td>Class Overall</td>"
                       f"<td>{details['success_rate']:.2%}</td>"
                       f"<td>{details['total_executions']}</td>"
@@ -932,25 +981,40 @@ def main():
                 # Print method-level information
                 for test_case in details['test_cases']:
                     method_name = test_case['name'].split('.')[-1]
-                    
-                    # Get most recent status
+                    full_method_name = test_case['name']
+                    method_link = get_develocity_method_link(test_name, full_method_name, QUARANTINE_THRESHOLD_DAYS)
                     recent_status = "N/A"
                     if test_case['recent_executions']:
                         recent_status = test_case['recent_executions'][-1].outcome
                     
-                    print(f"<tr><td></td><td>{method_name}</td>"
+                    print(f"<tr><td></td><td><a href=\"{method_link}\">{method_name}</a></td>"
                           f"<td>{test_case['success_rate']:.2%}</td>"
                           f"<td>{test_case['total_executions']}</td>"
                           f"<td>{recent_status}</td></tr>")
-                    
-                    # Print recent executions for the method
-                    print("<tr><td></td><td colspan=\"4\">Recent Executions:</td></tr>")
-                    for entry in test_case['recent_executions']:
-                        date_str = entry.timestamp.strftime('%Y-%m-%d %H:%M')
-                        print(f"<tr><td></td><td colspan=\"4\">{date_str} - {entry.outcome}</td></tr>")
                 
                 print("<tr><td colspan=\"5\">&nbsp;</td></tr>")  # Add spacing between classes
             print("</table>")
+            
+            # Print detailed execution history in collapsible sections
+            print("\n<details>")
+            print("<summary>Detailed Execution History</summary>\n")
+            
+            for test_name, details in cleared_tests.items():
+                print(f"\n### {test_name}")
+                
+                for test_case in details['test_cases']:
+                    method_name = test_case['name'].split('.')[-1]
+                    print(f"\n#### {method_name}")
+                    print("Recent Executions:")
+                    print("```")
+                    print("Date/Time (UTC)      Outcome    Build ID")
+                    print("-" * 44)
+                    for entry in test_case['recent_executions']:
+                        date_str = entry.timestamp.strftime('%Y-%m-%d %H:%M')
+                        print(f"{date_str:<17} {entry.outcome:<10} {entry.build_id}")
+                    print("```")
+            
+            print("</details>")
         
         # Print High-Priority Quarantined Tests
         print("\n## High-Priority Quarantined Tests")
@@ -970,9 +1034,10 @@ def main():
             
             for full_class_name, details in sorted_tests:
                 class_result = details['container_result']
+                class_link = get_develocity_class_link(full_class_name, QUARANTINE_THRESHOLD_DAYS)
                 
                 # Print class-level information
-                print(f"<tr><td colspan=\"5\">{full_class_name}</td></tr>")
+                print(f"<tr><td colspan=\"5\"><a href=\"{class_link}\">{full_class_name}</a></td></tr>")
                 print(f"<tr><td></td>"
                       f"<td>{details['days_quarantined']}</td>"
                       f"<td>{details['failure_rate']:.2%}</td>"
@@ -980,14 +1045,13 @@ def main():
                       f"<td>{class_result.outcome_distribution.total}</td></tr>")
                 
                 # Print build outcome statistics
-                print("<tr><td colspan=\"5\">Build Outcomes:</td></tr>")
-                print(f"<tr><td></td><td colspan=\"4\">"
+                print("<tr><td colspan=\"5\">Build Outcomes: "
                       f"Passed: {class_result.outcome_distribution.passed} | "
                       f"Failed: {class_result.outcome_distribution.failed} | "
                       f"Flaky: {class_result.outcome_distribution.flaky}"
-                      f"</td></tr>")
+                      "</td></tr>")
                 
-                # Print test method details
+                # Print test method summary
                 print("<tr><td colspan=\"5\">Test Methods (Last 7 Days):</td></tr>")
                 print("<tr><td>Method</td><td>Success Rate</td><td>Failure Rate</td><td>Total Runs</td><td>Recent Status</td></tr>")
                 
@@ -996,18 +1060,18 @@ def main():
                     reverse=True):
                     
                     method_name = test_method.name.split('.')[-1]
+                    method_link = get_develocity_method_link(full_class_name, test_method.name, QUARANTINE_THRESHOLD_DAYS)
                     total_runs = test_method.outcome_distribution.total
                     if total_runs > 0:
                         success_rate = test_method.outcome_distribution.passed / total_runs
                         failure_rate = (test_method.outcome_distribution.failed + 
                                       test_method.outcome_distribution.flaky) / total_runs
                         
-                        # Get most recent status
                         recent_status = "N/A"
                         if test_method.timeline:
                             recent_status = test_method.timeline[-1].outcome
                         
-                        print(f"<tr><td>{method_name}</td>"
+                        print(f"<tr><td><a href=\"{method_link}\">{method_name}</a></td>"
                               f"<td>{success_rate:.2%}</td>"
                               f"<td>{failure_rate:.2%}</td>"
                               f"<td>{total_runs}</td>"
@@ -1015,6 +1079,28 @@ def main():
                 
                 print("<tr><td colspan=\"5\">&nbsp;</td></tr>")  # Add spacing between classes
             print("</table>")
+            
+            # Print detailed execution history in collapsible sections
+            print("\n<details>")
+            print("<summary>Detailed Execution History</summary>\n")
+            
+            for full_class_name, details in sorted_tests:
+                print(f"\n### {full_class_name}")
+                
+                for test_method in details['test_cases']:
+                    method_name = test_method.name.split('.')[-1]
+                    if test_method.timeline:
+                        print(f"\n#### {method_name}")
+                        print("Recent Executions:")
+                        print("```")
+                        print("Date/Time (UTC)      Outcome    Build ID")
+                        print("-" * 44)
+                        for entry in sorted(test_method.timeline, key=lambda x: x.timestamp)[-5:]:
+                            date_str = entry.timestamp.strftime('%Y-%m-%d %H:%M')
+                            print(f"{date_str:<17} {entry.outcome:<10} {entry.build_id}")
+                        print("```")
+            
+            print("</details>")
 
     except Exception as e:
         logger.exception("Error occurred during report generation")
