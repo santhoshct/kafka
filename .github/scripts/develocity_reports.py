@@ -822,13 +822,13 @@ def print_most_problematic_tests(problematic_tests: Dict[str, Dict], threshold_d
     
     # Print table with class and method information
     print("\n<table>")
-    print("<tr><td>Class</td><td>Test Case</td><td>Failure Rate</td><td>Build Scans</td></tr>")
+    print("<tr><td>Class</td><td>Test Case</td><td>Failure Rate</td><td>Build Scans</td><td>Link</td></tr>")
     
     for test_name, details in sorted(problematic_tests.items(), 
                                    key=lambda x: x[1]['failure_rate'],
                                    reverse=True):
         class_link = get_develocity_class_link(test_name, threshold_days)
-        print(f"<tr><td colspan=\"4\">{test_name} <a href=\"{class_link}\">↗️</a></td></tr>")
+        print(f"<tr><td colspan=\"4\">{test_name}</td><td><a href=\"{class_link}\">↗️</a></td></tr>")
         
         for test_case in sorted(details['test_cases'],
                               key=lambda x: (x.outcome_distribution.failed + x.outcome_distribution.flaky) / x.outcome_distribution.total 
@@ -839,8 +839,9 @@ def print_most_problematic_tests(problematic_tests: Dict[str, Dict], threshold_d
                 method_link = get_develocity_method_link(test_name, test_case.name, threshold_days)
                 total_runs = test_case.outcome_distribution.total
                 failure_rate = (test_case.outcome_distribution.failed + test_case.outcome_distribution.flaky) / total_runs if total_runs > 0 else 0
-                print(f"<tr><td></td><td>{method_name} <a href=\"{method_link}\">↗️</a></td>"
-                      f"<td>{failure_rate:.2%}</td><td>{total_runs}</td></tr>")
+                print(f"<tr><td></td><td>{method_name}</td>"
+                      f"<td>{failure_rate:.2%}</td><td>{total_runs}</td>"
+                      f"<td><a href=\"{method_link}\">↗️</a></td></tr>")
     print("</table>")
     
     # Print detailed execution history
@@ -887,20 +888,20 @@ def print_flaky_regressions(flaky_regressions: Dict[str, Dict], threshold_days: 
     
     # Print table with test details
     print("\n<table>")
-    print("<tr><td>Test Class</td><td>Recent Flaky Rate</td><td>Historical Rate</td><td>Recent Executions</td></tr>")
+    print("<tr><td>Test Class</td><td>Recent Flaky Rate</td><td>Historical Rate</td><td>Recent Executions</td><td>Link</td></tr>")
     
     for test_name, details in flaky_regressions.items():
         class_link = get_develocity_class_link(test_name, threshold_days)
-        print(f"<tr><td colspan=\"4\">{test_name} <a href=\"{class_link}\">↗️</a></td></tr>")
+        print(f"<tr><td colspan=\"4\">{test_name}</td><td><a href=\"{class_link}\">↗️</a></td></tr>")
         print(f"<tr><td></td><td>{details['recent_flaky_rate']:.2%}</td>"
               f"<td>{details['historical_flaky_rate']:.2%}</td>"
-              f"<td>{len(details['recent_executions'])}</td></tr>")
+              f"<td>{len(details['recent_executions'])}</td><td></td></tr>")
         
         # Add recent execution details in sub-rows
-        print("<tr><td colspan=\"4\">Recent Executions:</td></tr>")
+        print("<tr><td colspan=\"5\">Recent Executions:</td></tr>")
         for entry in sorted(details['recent_executions'], key=lambda x: x.timestamp)[-5:]:
             date_str = entry.timestamp.strftime('%Y-%m-%d %H:%M')
-            print(f"<tr><td></td><td colspan=\"3\">{date_str} - {entry.outcome}</td></tr>")
+            print(f"<tr><td></td><td colspan=\"4\">{date_str} - {entry.outcome}</td></tr>")
     print("</table>")
     
     # Print detailed history
@@ -939,17 +940,17 @@ def print_cleared_tests(cleared_tests: Dict[str, Dict], threshold_days: int):
     
     # Print table with class and method information
     print("\n<table>")
-    print("<tr><td>Test Class</td><td>Test Method</td><td>Success Rate</td><td>Total Runs</td><td>Recent Status</td></tr>")
+    print("<tr><td>Test Class</td><td>Test Method</td><td>Success Rate</td><td>Total Runs</td><td>Recent Status</td><td>Link</td></tr>")
     
     for test_name, details in sorted(cleared_tests.items(),
                                    key=lambda x: x[1]['success_rate'],
                                    reverse=True):
         class_link = get_develocity_class_link(test_name, threshold_days)
-        print(f"<tr><td colspan=\"5\">{test_name} <a href=\"{class_link}\">↗️</a></td></tr>")
+        print(f"<tr><td colspan=\"5\">{test_name}</td><td><a href=\"{class_link}\">↗️</a></td></tr>")
         print(f"<tr><td></td><td>Class Overall</td>"
               f"<td>{details['success_rate']:.2%}</td>"
               f"<td>{details['total_executions']}</td>"
-              f"<td>{details['successful_runs']} passed</td></tr>")
+              f"<td>{details['successful_runs']} passed</td><td></td></tr>")
         
         for test_case in details['test_cases']:
             method_name = test_case['name'].split('.')[-1]
@@ -958,11 +959,12 @@ def print_cleared_tests(cleared_tests: Dict[str, Dict], threshold_days: int):
             if test_case['recent_executions']:
                 recent_status = test_case['recent_executions'][-1].outcome
             
-            print(f"<tr><td></td><td>{method_name} <a href=\"{method_link}\">↗️</a></td>"
+            print(f"<tr><td></td><td>{method_name}</td>"
                   f"<td>{test_case['success_rate']:.2%}</td>"
                   f"<td>{test_case['total_executions']}</td>"
-                  f"<td>{recent_status}</td></tr>")
-        print("<tr><td colspan=\"5\">&nbsp;</td></tr>")
+                  f"<td>{recent_status}</td>"
+                  f"<td><a href=\"{method_link}\">↗️</a></td></tr>")
+        print("<tr><td colspan=\"6\">&nbsp;</td></tr>")
     print("</table>")
     
     # Print detailed history
