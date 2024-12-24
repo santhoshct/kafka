@@ -781,7 +781,7 @@ def get_develocity_class_link(class_name: str, threshold_days: int, test_type: s
     params = {
         "search.rootProjectNames": "kafka",
         "search.tags": "github,trunk",
-        "search.timeZoneId": "America/New_York",
+        "search.timeZoneId": "UTC",
         "search.relativeStartTime": f"P{threshold_days}D",
         "tests.container": class_name
     }
@@ -810,7 +810,7 @@ def get_develocity_method_link(class_name: str, method_name: str, threshold_days
     params = {
         "search.rootProjectNames": "kafka",
         "search.tags": "github,trunk",
-        "search.timeZoneId": "America/New_York",
+        "search.timeZoneId": "UTC",
         "search.relativeStartTime": f"P{threshold_days}D",
         "tests.container": class_name,
         "tests.test": method_name
