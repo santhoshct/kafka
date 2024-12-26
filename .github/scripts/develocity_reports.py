@@ -168,8 +168,8 @@ class TestAnalyzer:
         
         # Initialize cache providers
         self.cache_providers = [
-            # GitHubActionsCacheProvider(),
-            # LocalCacheProvider()
+            GitHubActionsCacheProvider(),
+            LocalCacheProvider()
         ]
         self.build_cache = None
         self._load_cache()
@@ -1119,10 +1119,9 @@ def main():
 if __name__ == "__main__":
     # Configure logging
     logging.basicConfig(
-        level=logging.DEBUG,
+        level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
         handlers=[
-            logging.FileHandler("flaky_test_report.log"),
             logging.StreamHandler()
         ]
     )
