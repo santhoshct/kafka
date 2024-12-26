@@ -168,8 +168,8 @@ class TestAnalyzer:
         
         # Initialize cache providers
         self.cache_providers = [
-            GitHubActionsCacheProvider(),
-            LocalCacheProvider()
+            # GitHubActionsCacheProvider(),
+            # LocalCacheProvider()
         ]
         self.build_cache = None
         self._load_cache()
@@ -212,7 +212,7 @@ class TestAnalyzer:
         chunk_end: datetime,
         project: str,
         test_type: str,
-        remaining_build_ids: set,
+        remaining_build_ids: set | None,
         max_builds_per_request: int
     ) -> Dict[str, BuildInfo]:
         """Helper method to process a single chunk of build information"""
@@ -225,7 +225,7 @@ class TestAnalyzer:
         from_build = None
         continue_chunk = True
 
-        while continue_chunk and remaining_build_ids:
+        while continue_chunk and (remaining_build_ids is None or remaining_build_ids):
             query_params = {
                 'query': query,
                 'models': ['gradle-attributes'],
@@ -273,7 +273,7 @@ class TestAnalyzer:
                             continue_chunk = False
                             break
                         
-                        if build_id in remaining_build_ids:
+                        if remaining_build_ids is None or build_id in remaining_build_ids:
                             if 'problem' not in gradle_attrs:
                                 chunk_builds[build_id] = BuildInfo(
                                     id=build_id,
@@ -281,6 +281,8 @@ class TestAnalyzer:
                                     duration=attrs.get('buildDuration'),
                                     has_failed=attrs.get('hasFailed', False)
                                 )
+                                if remaining_build_ids is not None:
+                                    remaining_build_ids.remove(build_id)
             
             if continue_chunk and response_json:
                 from_build = response_json[-1]['id']
@@ -290,38 +292,47 @@ class TestAnalyzer:
             time.sleep(0.5)  # Rate limiting between pagination requests
             
         return chunk_builds
-
-    def get_build_info(self, build_ids: List[str], project: str, test_type: str, query_days: int) -> Dict[str, BuildInfo]:
+    def get_build_info(self, build_ids: List[str] = None, project: str = None, test_type: str = None, query_days: int = None, bypass_cache: bool = False, fetch_all: bool = False) -> Dict[str, BuildInfo]:
         builds = {}
         max_builds_per_request = 100
         cutoff_date = datetime.now(pytz.UTC) - timedelta(days=query_days)
+        current_time = datetime.now(pytz.UTC)
         
-        # Get builds from cache if available
-        if self.build_cache:
+        if not fetch_all and not build_ids:
+            raise ValueError("Either build_ids must be provided or fetch_all must be True")
+        
+        # Get builds from cache if available and bypass_cache is False
+        if not bypass_cache and self.build_cache:
             cached_builds = self.build_cache.builds
             cached_cutoff = self.build_cache.last_update - timedelta(days=query_days)
             
-            # Use cached data for builds within the cache period
-            for build_id in build_ids:
-                if build_id in cached_builds:
-                    build = cached_builds[build_id]
+            if fetch_all:
+                # Use all cached builds within the time period
+                for build_id, build in cached_builds.items():
                     if build.timestamp >= cached_cutoff:
                         builds[build_id] = build
+            else:
+                # Use cached data for specific builds within the cache period
+                for build_id in build_ids:
+                    if build_id in cached_builds:
+                        build = cached_builds[build_id]
+                        if build.timestamp >= cached_cutoff:
+                            builds[build_id] = build
             
             # Update cutoff date to only fetch new data
             cutoff_date = self.build_cache.last_update
             logger.info(f"Using cached data up to {cutoff_date.isoformat()}")
             
-            # Remove already found builds from the search list
-            build_ids = [bid for bid in build_ids if bid not in builds]
-        
-        if not build_ids:
-            logger.info("All builds found in cache")
-            return builds
+            if not fetch_all:
+                # Remove already found builds from the search list
+                build_ids = [bid for bid in build_ids if bid not in builds]
+            
+                if not build_ids:
+                    logger.info("All builds found in cache")
+                    return builds
         
         # Fetch remaining builds from API
-        remaining_build_ids = set(build_ids)
-        current_time = datetime.now(pytz.UTC)
+        remaining_build_ids = set(build_ids) if not fetch_all else None
         chunk_size = self.default_chunk_size
 
         # Create time chunks
@@ -343,7 +354,7 @@ class TestAnalyzer:
                     chunk[1], 
                     project, 
                     test_type, 
-                    remaining_build_ids.copy(),
+                    remaining_build_ids.copy() if remaining_build_ids else None,
                     max_builds_per_request
                 ): chunk for chunk in chunks
             }
@@ -352,7 +363,8 @@ class TestAnalyzer:
                 try:
                     chunk_builds = future.result()
                     builds.update(chunk_builds)
-                    remaining_build_ids -= set(chunk_builds.keys())
+                    if remaining_build_ids:
+                        remaining_build_ids -= set(chunk_builds.keys())
                 except Exception as e:
                     logger.error(f"Chunk processing generated an exception: {str(e)}")
 
@@ -361,11 +373,11 @@ class TestAnalyzer:
             f"\nBuild Info Performance:"
             f"\n  Total Duration: {total_duration:.2f}s"
             f"\n  Builds Retrieved: {len(builds)}"
-            f"\n  Builds Not Found: {len(remaining_build_ids)}"
+            f"\n  Builds Not Found: {len(remaining_build_ids) if remaining_build_ids else 0}"
         )
         
-        # Update cache with new data
-        if builds:
+        # Update cache with new data if not bypassing cache
+        if builds and not bypass_cache:
             if not self.build_cache:
                 self.build_cache = BuildCache(current_time, {})
             self.build_cache.builds.update(builds)
@@ -373,7 +385,6 @@ class TestAnalyzer:
             self._save_cache()
         
         return builds
-
     def get_test_results(self, project: str, threshold_days: int, test_type: str = "quarantinedTest",
                         outcomes: List[str] = None) -> List[TestResult]:
         """Fetch test results with timeline information"""
@@ -464,6 +475,11 @@ class TestAnalyzer:
             # Sort timeline by timestamp
             result.timeline = sorted(timeline, key=lambda x: x.timestamp)
             logger.debug(f"Final timeline entries for {test_name}: {len(result.timeline)}")
+
+            # Print build details for debugging
+            logger.debug("Timeline entries:")
+            for entry in timeline:
+                logger.debug(f"Build ID: {entry.build_id}, Timestamp: {entry.timestamp}, Outcome: {entry.outcome}")
             
             # Calculate recent failure rate
             recent_cutoff = datetime.now(pytz.UTC) - timedelta(days=30)
@@ -768,6 +784,28 @@ class TestAnalyzer:
         
         return cleared_tests
 
+    def update_cache(self, builds: Dict[str, BuildInfo]):
+        """
+        Update the build cache with new build information.
+        
+        Args:
+            builds: Dictionary of build IDs to BuildInfo objects
+        """
+        current_time = datetime.now(pytz.UTC)
+        
+        # Initialize cache if it doesn't exist
+        if not self.build_cache:
+            self.build_cache = BuildCache(current_time, {})
+        
+        # Update builds and last update time
+        self.build_cache.builds.update(builds)
+        self.build_cache.last_update = current_time
+        
+        # Save to all cache providers
+        self._save_cache()
+        
+        logger.info(f"Updated cache with {len(builds)} builds")
+
 def get_develocity_class_link(class_name: str, threshold_days: int, test_type: str = None) -> str:
     """
     Generate Develocity link for a test class
@@ -1025,6 +1063,12 @@ def main():
     analyzer = TestAnalyzer(BASE_URL, token)
     
     try:
+        quarantined_builds = analyzer.get_build_info([], PROJECT, "quarantinedTest", 7, bypass_cache=True, fetch_all=True)
+        regular_builds = analyzer.get_build_info([], PROJECT, "test", 7, bypass_cache=True, fetch_all=True)
+
+        analyzer.update_cache(quarantined_builds)
+        analyzer.update_cache(regular_builds)
+
         # Get test results
         quarantined_results = analyzer.get_test_results(
             PROJECT, 
@@ -1075,10 +1119,11 @@ def main():
 if __name__ == "__main__":
     # Configure logging
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.DEBUG,
         format='%(asctime)s - %(levelname)s - %(message)s',
         handlers=[
-            logging.FileHandler("flaky_test_report.log")
+            logging.FileHandler("flaky_test_report.log"),
+            logging.StreamHandler()
         ]
     )
     main()
