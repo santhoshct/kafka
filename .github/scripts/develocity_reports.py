@@ -45,6 +45,7 @@ class BuildInfo:
     timestamp: datetime
     duration: int
     has_failed: bool
+    git_commit: str = ""  # Add this field for git commit info
 
 @dataclass
 class TestTimelineEntry:
@@ -275,11 +276,20 @@ class TestAnalyzer:
                         
                         if remaining_build_ids is None or build_id in remaining_build_ids:
                             if 'problem' not in gradle_attrs:
+                                # Extract git commit from values
+                                git_commit = ""
+                                if 'values' in attrs:
+                                    for value in attrs['values']:
+                                        if value['name'] == 'Git commit id':
+                                            git_commit = value['value']
+                                            break
+                                
                                 chunk_builds[build_id] = BuildInfo(
                                     id=build_id,
                                     timestamp=build_timestamp,
                                     duration=attrs.get('buildDuration'),
-                                    has_failed=attrs.get('hasFailed', False)
+                                    has_failed=attrs.get('hasFailed', False),
+                                    git_commit=git_commit
                                 )
                                 if remaining_build_ids is not None:
                                     remaining_build_ids.remove(build_id)
@@ -570,7 +580,8 @@ class TestAnalyzer:
         project: str,
         chunk_start: datetime,
         chunk_end: datetime,
-        test_type: str = "quarantinedTest"
+        test_type: str = "quarantinedTest",
+        include_passed: bool = False
     ) -> List[TestCaseResult]:
         """
         Fetch detailed test case results for a specific container.
@@ -587,7 +598,7 @@ class TestAnalyzer:
         
         query_params = {
             'query': query,
-            'testOutcomes': ['failed', 'flaky'],
+            'testOutcomes': ['failed', 'flaky', 'passed'] if include_passed else ['failed', 'flaky'],
             'container': container_name,
             'include': ['buildScanIds'],  # Explicitly request build scan IDs
             'limit': 1000
@@ -805,6 +816,26 @@ class TestAnalyzer:
         self._save_cache()
         
         logger.info(f"Updated cache with {len(builds)} builds")
+
+    def clear_cache(self):
+        """Clear the build cache from all providers."""
+        self.build_cache = None
+        for provider in self.cache_providers:
+            try:
+                if isinstance(provider, LocalCacheProvider):
+                    if os.path.exists(provider.cache_file):
+                        os.remove(provider.cache_file)
+                        logger.info(f"Cleared local cache file: {provider.cache_file}")
+                elif isinstance(provider, GitHubActionsCacheProvider):
+                    if os.environ.get('GITHUB_WORKSPACE'):
+                        cache_file = os.path.join(os.environ.get('GITHUB_WORKSPACE', ''), 
+                                                provider.cache_key + '.json')
+                        if os.path.exists(cache_file):
+                            os.remove(cache_file)
+                            logger.info(f"Cleared GitHub Actions cache file: {cache_file}")
+            except Exception as e:
+                logger.warning(f"Failed to clear cache for {provider.__class__.__name__}: {e}")
+        logger.info("Cache cleared from all providers")
 
 def get_develocity_class_link(class_name: str, threshold_days: int, test_type: str = None) -> str:
     """
