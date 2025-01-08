@@ -985,14 +985,13 @@ def print_most_problematic_tests(problematic_tests: Dict[str, Dict], threshold_d
                                 key=lambda x: (x.outcome_distribution.failed + x.outcome_distribution.flaky) / x.outcome_distribution.total 
                                 if x.outcome_distribution.total > 0 else 0,
                                 reverse=True):
-            method_name = test_method.name.split('.')[-1]
             if test_method.timeline:
                 print(f"\n#### {method_name}")
                 print("Recent Executions:")
                 print("```")
                 print("Date/Time (UTC)      Outcome    Build ID")
                 print("-" * 44)
-                for entry in sorted(test_method.timeline, key=lambda x: x.timestamp)[-5:]:
+                for entry in sorted(test_method.timeline, key=lambda x: x.timestamp, reverse=True)[:5]:
                     date_str = entry.timestamp.strftime('%Y-%m-%d %H:%M')
                     print(f"{date_str:<17} {entry.outcome:<10} {entry.build_id}")
                 print("```")
@@ -1021,7 +1020,7 @@ def print_flaky_regressions(flaky_regressions: Dict[str, Dict], threshold_days: 
         
         # Add recent execution details in sub-rows
         print("<tr><td colspan=\"5\">Recent Executions:</td></tr>")
-        for entry in sorted(details['recent_executions'], key=lambda x: x.timestamp)[-5:]:
+        for entry in sorted(details['recent_executions'], key=lambda x: x.timestamp, reverse=True)[:5]:
             date_str = entry.timestamp.strftime('%Y-%m-%d %H:%M')
             print(f"<tr><td></td><td colspan=\"4\">{date_str} - {entry.outcome}</td></tr>")
     print("</table>")
@@ -1040,7 +1039,7 @@ def print_flaky_regressions(flaky_regressions: Dict[str, Dict], threshold_days: 
         print("```")
         print("Date/Time (UTC)      Outcome    Build ID")
         print("-" * 44)
-        for entry in sorted(details['recent_executions'], key=lambda x: x.timestamp)[-5:]:
+        for entry in sorted(details['recent_executions'], key=lambda x: x.timestamp, reverse=True)[:5]:
             date_str = entry.timestamp.strftime('%Y-%m-%d %H:%M')
             print(f"{date_str:<17} {entry.outcome:<10} {entry.build_id}")
         print("```")
@@ -1097,11 +1096,11 @@ def print_persistent_failing_tests(persistent_failures: Dict[str, Dict], thresho
         for test_name, test_details in sorted(class_details['test_cases'].items(),
                                             key=lambda x: x[1]['failure_rate'],
                                             reverse=True):
-            print(f"\nRecent Executions:")
+            print("\nRecent Executions:")
             print("```")
             print("Date/Time (UTC)      Outcome    Build ID")
             print("-" * 44)
-            for entry in test_details['timeline'][-5:]:  # Show last 5 executions
+            for entry in sorted(test_details['timeline'], key=lambda x: x.timestamp, reverse=True)[:5]:
                 date_str = entry.timestamp.strftime('%Y-%m-%d %H:%M')
                 print(f"{date_str:<17} {entry.outcome:<10} {entry.build_id}")
             print("```")
@@ -1171,7 +1170,7 @@ def print_cleared_tests(cleared_tests: Dict[str, Dict], threshold_days: int, tes
             print("```")
             print("Date/Time (UTC)      Outcome    Build ID")
             print("-" * 44)
-            for entry in test_case['recent_executions']:
+            for entry in sorted(test_case['recent_executions'], key=lambda x: x.timestamp, reverse=True)[:5]:
                 date_str = entry.timestamp.strftime('%Y-%m-%d %H:%M')
                 print(f"{date_str:<17} {entry.outcome:<10} {entry.build_id}")
             print("```")
